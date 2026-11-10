@@ -155,6 +155,7 @@ class UlyssesAttention(ContextParallelAttention):
 
     The first exchange gathers the whole sequence for each rank's assigned heads. The original attention function
     runs on those heads; the second exchange returns each token's output with all heads to its original rank.
+    Under tensor parallelism, a rank holds only `num_heads / tp_size` heads, and Ulysses splits those across CP ranks.
     """
 
     def install_forward(self, module: nn.Module, cp_mesh: DeviceMesh):
@@ -176,12 +177,14 @@ class UlyssesAttention(ContextParallelAttention):
         config = module.config.get_text_config()
         num_kv_heads = getattr(config, "num_key_value_heads", None) or config.num_attention_heads
         cp_size = cp_mesh.size()
-        if config.num_attention_heads % cp_size or num_kv_heads % cp_size:
+        distributed_config = getattr(module.config, "distributed_config", None)
+        tp_size = 1 if distributed_config is None else distributed_config.tp_size
+        if config.num_attention_heads % (cp_size * tp_size) or num_kv_heads % (cp_size * tp_size):
             raise ValueError(
-                f"Ulysses context parallelism splits the attention heads across the {cp_size} ranks of the `cp` mesh, "
-                f"so `cp_size` must divide both the number of attention heads ({config.num_attention_heads}) and the "
-                f"number of key/value heads ({num_kv_heads}) of {module.__class__.__name__}. Use another `cp_size`, or "
-                "disable context parallelism."
+                f"Ulysses context parallelism splits the attention heads across the {cp_size} ranks of the `cp` mesh "
+                f"and the {tp_size} ranks of the `tp` mesh, so `cp_size * tp_size` must divide both the number of "
+                f"attention heads ({config.num_attention_heads}) and the number of key/value heads ({num_kv_heads}) "
+                f"of {module.__class__.__name__}. Use smaller `cp_size` or `tp_size`, or disable context parallelism."
             )
 
     def attention(self, cp_mesh: DeviceMesh, attention_function, module, query, key, value, attention_mask, **kwargs):
