@@ -24,6 +24,7 @@ from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
 from ...integrations import use_kernel_forward_from_hub, use_kernel_func_from_hub_with_fallback, use_kernelized_func
 from ...integrations.accelerate import force_accelerate_hooks
+from ...integrations.linear_attention import ALL_CAUSAL_CONV1D_FUNCTIONS
 from ...masking_utils import create_causal_mask, create_recurrent_attention_mask
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
@@ -160,7 +161,6 @@ class Qwen3NextAttention(Qwen3MoeAttention):
         return attn_output, attn_weights
 
 
-@use_kernel_func_from_hub_with_fallback("causal_conv1d_update", "causal_conv1d")
 def causal_conv1d_update(
     hidden_states: torch.Tensor,
     conv_state: torch.Tensor,
@@ -180,7 +180,6 @@ def causal_conv1d_update(
     return out.to(hidden_states.dtype)
 
 
-@use_kernel_func_from_hub_with_fallback("causal_conv1d_fn", "causal_conv1d")
 def causal_conv1d_fn(
     hidden_states: torch.Tensor,
     weight: nn.Parameter,
@@ -201,6 +200,39 @@ def causal_conv1d_fn(
     if activation is not None:
         out = ACT2FN[activation](out)
     return out.to(hidden_states.dtype)
+
+
+def eager_causal_conv1d_forward(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    cache: Cache | None = None,
+    **kwargs,
+) -> torch.Tensor:
+    if kwargs.get("cu_seq_lens_q") is not None or kwargs.get("seq_idx") is not None:
+        raise ValueError(
+            'The eager causal convolution cannot keep packed sequences apart. Use `linear_attn_implementation="fla"` '
+            "to train on packed sequences."
+        )
+    seq_len = hidden_states.shape[1]
+    hidden_states = hidden_states.transpose(1, 2)
+    layer_idx, weight, bias = module.layer_idx, module.conv1d.weight.squeeze(1), module.conv1d.bias
+
+    # The conv state may be None if the layer is not initialized
+    conv_state = cache.get_conv_state(layer_idx, state_idx=0) if cache is not None else None
+
+    # Decode with cache: the conv state is updated in-place
+    if conv_state is not None and seq_len == 1 and not cache.is_recording_past(layer_idx):
+        hidden_states = causal_conv1d_update(hidden_states, conv_state, weight, bias, module.activation)
+    # Prefill with cache: the conv state is updated and the output is truncated
+    elif cache is not None:
+        hidden_states = cache.update_conv_state(hidden_states, layer_idx, conv_kernel_size=module.conv_kernel_size)
+        hidden_states = causal_conv1d_fn(hidden_states, weight, bias, activation=module.activation)
+        hidden_states = hidden_states[:, :, -seq_len:]
+    # No cache: just run the convolution
+    else:
+        hidden_states = causal_conv1d_fn(hidden_states, weight, bias, activation=module.activation)
+
+    return hidden_states.transpose(1, 2)
 
 
 # NOTE: the FLA package computes `x / torch.sqrt((x * x).sum(dim=dim, keepdim=True) + eps)` instead, so if we align
@@ -421,12 +453,11 @@ def torch_recurrent_gated_delta_rule(
     return core_attn_out, last_recurrent_state
 
 
-@use_kernelized_func(
-    [torch_recurrent_gated_delta_rule, torch_chunk_gated_delta_rule, causal_conv1d_fn, causal_conv1d_update]
-)
+@use_kernelized_func([torch_recurrent_gated_delta_rule, torch_chunk_gated_delta_rule])
 class Qwen3NextGatedDeltaNet(nn.Module):
     def __init__(self, config: Qwen3NextConfig, layer_idx: int):
         super().__init__()
+        self.config = config
         self.hidden_size = config.hidden_size
         self.num_v_heads = config.linear_num_value_heads
         self.num_k_heads = config.linear_num_key_heads
@@ -512,12 +543,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         # Set up dimensions for reshapes later
         seq_len = hidden_states.shape[1]
-        # Retrieve conv and recurrent states if there is a cache. They may be None if the layer is not initialized.
-        if cache is not None:
-            conv_state = cache.get_conv_state(self.layer_idx, state_idx=0)
-            recurrent_state = cache.get_recurrent_state(self.layer_idx, state_idx=0)
-        else:
-            conv_state, recurrent_state = None, None
+        # Retrieve the recurrent state if there is a cache, before the convolution updates it. It may be None if the
+        # layer is not initialized.
+        recurrent_state = cache.get_recurrent_state(self.layer_idx, state_idx=0) if cache is not None else None
 
         projected_states_qkvz = self.in_proj_qkvz(hidden_states)
         projected_states_ba = self.in_proj_ba(hidden_states)
@@ -525,34 +553,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         query, key, value = (x.reshape(x.shape[0], x.shape[1], -1) for x in (query, key, value))
 
         mixed_qkv = torch.cat((query, key, value), dim=-1)
-        mixed_qkv = mixed_qkv.transpose(1, 2)
 
-        if conv_state is not None and seq_len == 1 and not cache.is_recording_past(self.layer_idx):
-            # Single-token cached decode: the fused per-step kernel updates the conv state in-place.
-            mixed_qkv = causal_conv1d_update(
-                mixed_qkv,
-                conv_state,
-                self.conv1d.weight.squeeze(1),
-                self.conv1d.bias,
-                self.activation,
-            )
-        else:
-            if cache is not None:
-                mixed_qkv = cache.update_conv_state(mixed_qkv, self.layer_idx, conv_kernel_size=self.conv_kernel_size)
+        causal_conv1d_interface: Callable = ALL_CAUSAL_CONV1D_FUNCTIONS.get_interface(
+            self.config._linear_attn_implementation, eager_causal_conv1d_forward
+        )
+        mixed_qkv = causal_conv1d_interface(self, mixed_qkv, cache=cache, **kwargs)
 
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv,
-                self.conv1d.weight.squeeze(1),
-                self.conv1d.bias,
-                activation=self.activation,
-                **kwargs,
-            )
-
-            # Drop the additional previous states
-            if cache is not None:
-                mixed_qkv = mixed_qkv[:, :, -seq_len:]
-
-        mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(
             mixed_qkv,
             [
