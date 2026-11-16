@@ -13,8 +13,8 @@
 # limitations under the License.
 """
 Integration of the "flash-linear-attention" kernels, reachable through the `kernels` package or the original package.
-This interface can be used by passing `linear_attention_implementation="kernels-community/fla"`, which directly reaches
-for the Hub kernel through `kernels`. You can also use `linear_attention_implementation="fla"`, which reaches for the
+This interface can be used by passing `linear_attn_implementation="kernels-community/fla"`, which directly reaches
+for the Hub kernel through `kernels`. You can also use `linear_attn_implementation="fla"`, which reaches for the
 original package and falls back to the Hub kernel if the package is not installed.
 """
 
@@ -27,7 +27,7 @@ import torch
 from torch import nn
 
 from ..utils import logging
-from ..utils.import_utils import is_flash_linear_attention_available
+from ..utils.import_utils import is_flash_linear_attention_available, is_kernels_available
 
 
 if TYPE_CHECKING:
@@ -49,11 +49,16 @@ def _load_hub_fla_conv() -> tuple[Callable, Callable]:
     """`causal_conv1d` and `causal_conv1d_update` from the Hub kernel (`kernels-community/fla`)."""
     from .hub_kernels import lazy_load_kernel
 
-    kernel = lazy_load_kernel("fla")
-    if kernel is None:
+    if not is_kernels_available():
         raise ImportError(
             f'`linear_attn_implementation="{FLA_HUB_KERNEL}"` needs the `kernels` package to load the Hub kernel. '
             "Install it with `pip install kernels`."
+        )
+    kernel = lazy_load_kernel("fla")
+    if kernel is None:
+        raise ImportError(
+            f"Could not load the `{FLA_HUB_KERNEL}` Hub kernel. Check the warnings above, your connection to the Hub, "
+            "and that `USE_HUB_KERNELS` is not set to disable the Hub kernels."
         )
     return kernel.modules.convolution.causal_conv1d, kernel.modules.convolution.causal_conv1d_update
 
@@ -100,13 +105,26 @@ def fla_causal_conv1d_forward(
         hidden_states, _ = conv_update_fn(hidden_states, conv_state, weight=weight, bias=bias, activation=activation)
         return hidden_states
 
+    # Packed sequences are kept apart with `cu_seq_lens_q` to match the `fla` library. An older variation of this arg
+    # was `seq_idx`, which carries the same information but is not favored. It is supported with a warning.
+    cu_seqlens, seq_idx = kwargs.get("cu_seq_lens_q"), kwargs.get("seq_idx")
+    if cu_seqlens is None and seq_idx is not None:
+        logger.warning_once(
+            "`seq_idx` was passed without `cu_seq_lens_q`: converting it to `cu_seq_lens_q` for the convolution. Pass "
+            "`cu_seq_lens_q` to avoid this warning."
+        )
+        _, seq_lens = torch.unique_consecutive(seq_idx.flatten(), return_counts=True)
+        cu_seqlens = nn.functional.pad(seq_lens.cumsum(0), (1, 0)).to(torch.int32)
+    elif cu_seqlens is None:
+        raise ValueError("`cu_seq_lens_q` is required when `seq_idx` is not passed.")
+
     output, _ = conv_fn(
         hidden_states,
         weight=weight,
         bias=bias,
         initial_state=None if conv_state is None else conv_state[..., -module.conv_kernel_size :],
         activation=activation,
-        cu_seqlens=kwargs.get("cu_seq_lens_q"),
+        cu_seqlens=cu_seqlens,
     )
     # The cache keeps the last inputs as the next conv state. This comes after the convolution, which reads the current
     # conv state that the update overwrites in place
