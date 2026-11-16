@@ -76,8 +76,10 @@ from .integrations.deepspeed import _load_state_dict_into_zero3_model, prevent_a
 from .integrations.eager_paged import eager_paged_attention_forward
 from .integrations.finegrained_fp8 import ALL_FP8_EXPERTS_FUNCTIONS
 from .integrations.flash_attention import flash_attention_forward
+from .integrations.flash_linear_attention import FLA_HUB_KERNEL, lazy_import_fla_conv
 from .integrations.flex_attention import flex_attention_forward
 from .integrations.hub_kernels import allow_all_hub_kernels, is_kernel, kernelize
+from .integrations.linear_attention import ALL_LINEAR_ATTENTION_INTERFACES
 from .integrations.moe import ALL_EXPERTS_FUNCTIONS
 from .integrations.peft import maybe_load_adapters
 from .integrations.sdpa_attention import sdpa_attention_forward
@@ -127,6 +129,7 @@ from .utils.import_utils import (
     KERNELS_MAX_VERSION,
     KERNELS_MIN_VERSION,
     is_flash_attn_greater_or_equal,
+    is_flash_linear_attention_available,
     is_huggingface_hub_greater_or_equal,
     is_sagemaker_mp_enabled,
     is_torch_cuda_available,
@@ -1266,6 +1269,11 @@ class PreTrainedModel(
         self.config._experts_implementation_internal = self._check_and_adjust_experts_implementation(
             self.config._experts_implementation
         )
+        # Check the linear attention implementation is supported, or set it if not yet set (on the internal attr, to
+        # avoid setting it recursively)
+        self.config._linear_attn_implementation_internal = self._check_and_adjust_linear_attn_implementation(
+            self.config._linear_attn_implementation
+        )
         if self.can_generate():
             # `from_model_config` is a legacy behavior -- we shouldn't set generation flags in the model config
             try:
@@ -1422,6 +1430,10 @@ class PreTrainedModel(
         # If passing `experts_implementation` as kwargs, respect it (it will be applied recursively on subconfigs)
         if "experts_implementation" in kwargs:
             config._experts_implementation = kwargs.pop("experts_implementation")
+
+        # If passing `linear_attn_implementation` as kwargs, respect it (it will be applied recursively on subconfigs)
+        if "linear_attn_implementation" in kwargs:
+            config._linear_attn_implementation = kwargs.pop("linear_attn_implementation")
 
         # Needed if the attn_implementation is an outside `kernels-community` kernel
         allow_all_kernels = kwargs.get("allow_all_kernels", False)
@@ -1852,6 +1864,47 @@ class PreTrainedModel(
         applicable_experts_implementation = self.get_correct_experts_implementation(experts_implementation)
         return applicable_experts_implementation
 
+    def _check_and_adjust_linear_attn_implementation(self, linear_attn_implementation: str | None) -> str:
+        """
+        Check that the `linear_attn_implementation` exists, and preload its kernels. It defaults to `"eager"`. As for
+        flash attention, `"fla"` falls back to the Hub kernel (`"kernels-community/fla"`) if the `flash-linear-attention`
+        package is not installed.
+
+        Args:
+            linear_attn_implementation (`str` or `None`):
+                The linear attention implementation to check for existence/validity.
+        Returns:
+            `str`: The final linear attention implementation to use.
+        """
+        if linear_attn_implementation is None:
+            return "eager"
+        valid_implementations = {"eager"}.union(*(interface.keys() for interface in ALL_LINEAR_ATTENTION_INTERFACES))
+        if linear_attn_implementation not in valid_implementations:
+            valid = ", ".join(f'`linear_attn_implementation="{fn}"`' for fn in sorted(valid_implementations))
+            raise ValueError(
+                f'Specified `linear_attn_implementation="{linear_attn_implementation}"` is not supported. The only '
+                f"possible arguments are {valid}."
+            )
+
+        # If the package is not installed, do not fail but use the Hub kernel instead if possible
+        requested_package_without_install = (
+            linear_attn_implementation == "fla"
+            and not is_flash_linear_attention_available()
+            and is_kernels_available()
+        )
+        if requested_package_without_install:
+            linear_attn_implementation = FLA_HUB_KERNEL
+
+        if linear_attn_implementation in ("fla", FLA_HUB_KERNEL):
+            # Preload the kernels here, to raise early and to allow compile with fullgraph
+            lazy_import_fla_conv(linear_attn_implementation)
+            if requested_package_without_install:
+                logger.warning_once(
+                    f"You do not have `flash-linear-attention` installed, using `{FLA_HUB_KERNEL}` from the `kernels` "
+                    "library instead!"
+                )
+        return linear_attn_implementation
+
     def get_correct_attn_implementation(self, requested_attention: str | None, is_init_check: bool = False) -> str:
         applicable_attention = "sdpa" if requested_attention is None else requested_attention
         if applicable_attention not in ["eager"] + ALL_ATTENTION_FUNCTIONS.valid_keys():
@@ -2143,6 +2196,51 @@ class PreTrainedModel(
                 # Check the module can use correctly, otherwise we raise an error if requested experts can't be set for submodule
                 sub_implementation = submodule.get_correct_experts_implementation(sub_implementation)
                 submodule.config._experts_implementation_internal = sub_implementation
+
+    def set_linear_attn_implementation(self, linear_attn_implementation: str | dict):
+        """
+        Set the requested `linear_attn_implementation` for this model.
+
+        Args:
+            linear_attn_implementation (`str` or `dict`):
+                The linear attention implementation to set for this model. It can be either a `str`, in which case it
+                will be dispatched to all submodels if relevant, or a `dict` where keys are the sub_configs name, in
+                which case each submodel will dispatch the corresponding value.
+        """
+        requested_implementation = (
+            linear_attn_implementation
+            if not isinstance(linear_attn_implementation, dict)
+            else linear_attn_implementation.get("", self.config._linear_attn_implementation)
+        )
+
+        # Check the requested implementation is supported, and apply it to the top level config (on the internal attr,
+        # to avoid setting it recursively)
+        if requested_implementation != self.config._linear_attn_implementation:
+            self.config._linear_attn_implementation_internal = self._check_and_adjust_linear_attn_implementation(
+                requested_implementation
+            )
+
+        # Apply it to all submodels as well
+        for submodule in self.modules():
+            # We found a submodel (which is not self) with a different config (otherwise, it may be the same "actual model",
+            # e.g. ForCausalLM has a Model inside, but no need to check it again)
+            if (
+                submodule is not self
+                and isinstance(submodule, PreTrainedModel)
+                and submodule.config.__class__ != self.config.__class__
+            ):
+                sub_implementation = requested_implementation
+                if isinstance(linear_attn_implementation, dict):
+                    for subconfig_key in self.config.sub_configs:
+                        # We need to check for exact object match here, with `is`
+                        if getattr(self.config, subconfig_key) is submodule.config:
+                            sub_implementation = linear_attn_implementation.get(
+                                subconfig_key, submodule.config._linear_attn_implementation
+                            )
+                            break
+                submodule.config._linear_attn_implementation_internal = (
+                    submodule._check_and_adjust_linear_attn_implementation(sub_implementation)
+                )
 
     def enable_input_require_grads(self):
         """
@@ -4311,6 +4409,9 @@ class PreTrainedModel(
 
         if "experts_implementation" in kwargs:
             config._experts_implementation = kwargs.pop("experts_implementation")
+
+        if "linear_attn_implementation" in kwargs:
+            config._linear_attn_implementation = kwargs.pop("linear_attn_implementation")
 
         hf_quantizer, config, device_map = get_hf_quantizer(
             config, quantization_config, device_map, weights_only, user_agent, gguf_file=gguf_file
