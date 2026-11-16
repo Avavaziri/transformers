@@ -115,8 +115,6 @@ def fla_causal_conv1d_forward(
         )
         _, seq_lens = torch.unique_consecutive(seq_idx.flatten(), return_counts=True)
         cu_seqlens = nn.functional.pad(seq_lens.cumsum(0), (1, 0)).to(torch.int32)
-    elif cu_seqlens is None:
-        raise ValueError("`cu_seq_lens_q` is required when `seq_idx` is not passed.")
 
     output, _ = conv_fn(
         hidden_states,
