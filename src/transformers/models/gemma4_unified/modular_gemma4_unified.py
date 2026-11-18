@@ -15,6 +15,7 @@ import math
 from dataclasses import dataclass
 from typing import Literal
 
+import numpy as np
 import torch
 from huggingface_hub.dataclasses import strict
 from torch import nn
@@ -41,6 +42,7 @@ from ..gemma4.image_processing_gemma4 import (
     convert_image_to_patches,
     pad_along_first_dim,
 )
+from ..gemma4.image_processing_pil_gemma4 import Gemma4ImageProcessorPil
 from ..gemma4.modeling_gemma4 import (
     Gemma4CausalLMOutputWithPast,
     Gemma4ForCausalLM,
@@ -233,6 +235,103 @@ class Gemma4UnifiedImageProcessor(Gemma4ImageProcessor):
         # Stack into batch tensors
         pixel_values = torch.stack(pixel_values, dim=0)  # (batch, max_soft_tokens, model_patch_size²*3)
         position_ids = torch.stack(position_ids, dim=0)  # (batch, max_soft_tokens, 2)
+
+        data = {
+            "pixel_values": pixel_values,
+            "image_position_ids": position_ids,
+            "num_soft_tokens_per_image": num_soft_tokens_per_image,
+        }
+        return BatchFeature(data=data, tensor_type=return_tensors)
+
+
+def convert_image_to_merged_patches(
+    image: np.ndarray, patch_size: int, pooling_kernel_size: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Convert a (num_channels, height, width) image into merged model patches and their XY positions.
+
+    Gives the same result as patchifying with `patch_size` and merging each k×k group with `patches_merge`:
+    a merged patch is one `(k * patch_size)` square of the image, flattened in (row, column, channel) order.
+
+    Returns:
+        patches: (num_model_patches, (k * patch_size)² × num_channels)
+        positions: (num_model_patches, 2) — XY position of each merged patch.
+    """
+    model_patch_size = patch_size * pooling_kernel_size
+    num_channels, image_height, image_width = image.shape
+    num_patches_height = image_height // model_patch_size
+    num_patches_width = image_width // model_patch_size
+    patches = image.reshape(num_channels, num_patches_height, model_patch_size, num_patches_width, model_patch_size)
+    patches = patches.transpose(1, 3, 2, 4, 0).reshape(num_patches_height * num_patches_width, -1)
+
+    grid_x, grid_y = np.meshgrid(np.arange(num_patches_width), np.arange(num_patches_height), indexing="xy")
+    positions = np.stack([grid_x, grid_y], axis=-1).reshape(-1, 2)
+    return patches, positions
+
+
+@auto_docstring(custom_intro="Constructs a Gemma4 unified image processor.")
+class Gemma4UnifiedImageProcessorPil(Gemma4ImageProcessorPil):
+    valid_kwargs = Gemma4UnifiedImageProcessorKwargs
+
+    def _preprocess(
+        self,
+        images: list[np.ndarray],
+        do_resize: bool,
+        resample: "PILImageResampling | int | None",
+        do_rescale: bool,
+        rescale_factor: float,
+        do_normalize: bool,
+        image_mean: float | list[float] | None,
+        image_std: float | list[float] | None,
+        return_tensors: str | TensorType | None,
+        max_soft_tokens: int | None = None,
+        patch_size: int | None = None,
+        pooling_kernel_size: int | None = None,
+        **kwargs,
+    ) -> BatchFeature:
+        if max_soft_tokens not in _SUPPORTED_SOFT_TOKENS:
+            raise ValueError(f"`max_soft_tokens` must be one of {_SUPPORTED_SOFT_TOKENS}, got {max_soft_tokens}.")
+
+        # Compute max_patches from max_soft_tokens and pooling_kernel_size
+        max_patches = max_soft_tokens * pooling_kernel_size**2
+
+        pixel_values = []
+        position_ids = []
+        num_soft_tokens_per_image = []
+
+        for image in images:
+            # Step 1: Aspect-ratio-preserving resize
+            if do_resize:
+                image = self.aspect_ratio_preserving_resize(
+                    image=image,
+                    patch_size=patch_size,
+                    max_patches=max_patches,
+                    pooling_kernel_size=pooling_kernel_size,
+                    resample=resample,
+                )
+
+            # Step 2: Rescale pixel values from [0, 255] to [0, 1]
+            if do_rescale:
+                image = self.rescale(image=image, scale=rescale_factor)
+
+            # Step 3: Identity normalization because Gemma4 was trained with pixels in [0, 1]
+            if do_normalize:
+                image = self.normalize(image=image, mean=image_mean, std=image_std)
+
+            # Step 4: Patchify straight into merged model patches (k×k teacher patches each)
+            merged_patches, merged_positions = convert_image_to_merged_patches(image, patch_size, pooling_kernel_size)
+            num_soft_tokens_per_image.append(merged_patches.shape[0])
+
+            # Step 5: Pad merged patches with zeros and positions with -1 up to max_soft_tokens
+            padding_length = max_soft_tokens - merged_patches.shape[0]
+            merged_patches = np.pad(merged_patches, [(0, padding_length), (0, 0)], constant_values=0)
+            merged_positions = np.pad(merged_positions, [(0, padding_length), (0, 0)], constant_values=-1)
+            pixel_values.append(merged_patches)
+            position_ids.append(merged_positions)
+
+        # Stack into batch arrays
+        pixel_values = np.stack(pixel_values, axis=0)  # (batch, max_soft_tokens, model_patch_size²*3)
+        position_ids = np.stack(position_ids, axis=0)  # (batch, max_soft_tokens, 2)
 
         data = {
             "pixel_values": pixel_values,
@@ -1408,6 +1507,7 @@ __getattr__ = deprecate_attr(__name__, rename={"Gemma4UnifiedProcessorKwargs": (
 
 __all__ = [
     "Gemma4UnifiedImageProcessor",
+    "Gemma4UnifiedImageProcessorPil",
     "Gemma4UnifiedVideoProcessor",
     "Gemma4UnifiedProcessor",
     "Gemma4UnifiedAudioConfig",

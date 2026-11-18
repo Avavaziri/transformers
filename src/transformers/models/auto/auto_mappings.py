@@ -1431,7 +1431,7 @@ IMAGE_PROCESSOR_MAPPING_NAMES = OrderedDict(
         ("fuyu", {"pil": "FuyuImageProcessorPil", "torchvision": "FuyuImageProcessor"}),
         ("gemma3", {"pil": "Gemma3ImageProcessorPil", "torchvision": "Gemma3ImageProcessor"}),
         ("gemma4", {"pil": "Gemma4ImageProcessorPil", "torchvision": "Gemma4ImageProcessor"}),
-        ("gemma4_unified", {"torchvision": "Gemma4UnifiedImageProcessor"}),
+        ("gemma4_unified", {"pil": "Gemma4UnifiedImageProcessorPil", "torchvision": "Gemma4UnifiedImageProcessor"}),
         ("glm46v", {"pil": "Glm46VImageProcessorPil", "torchvision": "Glm46VImageProcessor"}),
         ("glm4v", {"pil": "Glm4vImageProcessorPil", "torchvision": "Glm4vImageProcessor"}),
         ("glm5_next", {"pil": "Glm5NextImageProcessorPil", "torchvision": "Glm5NextImageProcessor"}),

@@ -18,7 +18,8 @@ import numpy as np
 from parameterized import parameterized
 
 from transformers.models.gemma4.image_processing_pil_gemma4 import get_aspect_ratio_preserving_size
-from transformers.testing_utils import require_torch, require_vision
+from transformers.models.gemma4_unified.image_processing_pil_gemma4_unified import convert_image_to_merged_patches
+from transformers.testing_utils import require_torch, require_torchvision, require_vision
 from transformers.utils import is_torch_available, is_torchvision_available, is_vision_available
 
 from ...test_image_processing_common import ImageProcessingTester, ImageProcessingTestMixin
@@ -31,7 +32,10 @@ if is_vision_available():
     from PIL import Image
 
     if is_torchvision_available():
-        pass
+        from transformers.models.gemma4_unified.image_processing_gemma4_unified import (
+            convert_image_to_patches,
+            patches_merge,
+        )
 
 
 class Gemma4UnifiedImageProcessingTester(ImageProcessingTester):
@@ -168,3 +172,22 @@ class Gemma4UnifiedImageProcessingTest(ImageProcessingTestMixin, unittest.TestCa
             if pad_mask.any():
                 pad_patches = result.pixel_values[0, pad_mask]
                 self.assertTrue((pad_patches == 0).all())
+
+    @require_torchvision
+    @parameterized.expand([(96, 144, 16, 3), (60, 40, 5, 2), (30, 30, 6, 1)])
+    def test_merged_patches_match_patches_merge(self, height, width, patch_size, pooling_kernel_size):
+        """Test that the PIL backend's direct merged patchify matches torch `patches_merge` exactly."""
+        image = np.random.rand(3, height, width).astype(np.float32)
+
+        teacher_patches = convert_image_to_patches(torch.from_numpy(image), patch_size)
+        grid_x, grid_y = torch.meshgrid(
+            torch.arange(width // patch_size), torch.arange(height // patch_size), indexing="xy"
+        )
+        teacher_positions = torch.stack([grid_x, grid_y], dim=-1).reshape(-1, 2)
+        expected_patches, expected_positions = patches_merge(
+            teacher_patches[None], teacher_positions[None], teacher_patches.shape[0] // pooling_kernel_size**2
+        )
+
+        patches, positions = convert_image_to_merged_patches(image, patch_size, pooling_kernel_size)
+        np.testing.assert_array_equal(patches, expected_patches[0].numpy())
+        np.testing.assert_array_equal(positions, expected_positions[0].numpy())

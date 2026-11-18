@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from .configuration_gemma4_unified import *
     from .feature_extraction_gemma4_unified import *
     from .image_processing_gemma4_unified import *
+    from .image_processing_pil_gemma4_unified import *
     from .modeling_gemma4_unified import *
     from .processing_gemma4_unified import *
     from .video_processing_gemma4_unified import *

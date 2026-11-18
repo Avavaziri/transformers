@@ -224,6 +224,11 @@ print(processor.decode(outputs[0][input_len:], skip_special_tokens=False))
 [[autodoc]] Gemma4UnifiedAudioFeatureExtractor
     - __call__
 
+## Gemma4UnifiedImageProcessorPil
+
+[[autodoc]] Gemma4UnifiedImageProcessorPil
+    - preprocess
+
 ## Gemma4UnifiedImageProcessor
 
 [[autodoc]] Gemma4UnifiedImageProcessor
